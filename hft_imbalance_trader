@@ -1,0 +1,492 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jan 24 13:03:11 2022
+
+@author: dylan
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Thu May  6 12:30:00 2021
+
+@author: dylan
+"""
+
+import alpaca_trade_api as tradeapi
+import requests
+from bs4 import BeautifulSoup
+import csv
+import json
+import pandas as pd
+import numpy as np
+from tda import auth, client
+from tda.orders.equities import equity_buy_limit, equity_buy_market, equity_sell_market, equity_sell_limit
+from tda.orders.common import Duration, Session
+import personal_vars
+import time
+from datetime import datetime
+import math
+import matplotlib.pyplot as plt
+from pytz import timezone
+import sys
+import calculate_rsi
+
+# ALPACA API Info for fetching data, portfolio, etc. from Alpaca
+BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_API_KEY = "PKAU1W5OWUM6942S3MM0"
+ALPACA_SECRET_KEY = "BPJgvm8F9SiWsrufM5NqtcdY3rlEHchaxOELM0Yy"
+
+# Instantiate REST API Connection
+api = tradeapi.REST(key_id=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY, 
+                    base_url=BASE_URL, api_version='v2')
+
+def getQuote(c, ticker):
+    try:
+        r = c.get_quote(ticker)
+        return r.json()
+    except Exception as e:
+        print(e)
+        
+def getAlpacaQuote(api, ticker):
+    return api.get_last_quote(ticker)
+
+def calculateImbalance(quote):
+    ask = quote.asksize
+    bid = quote.bidsize
+    current_imbalance = (bid - ask) / (bid + ask + 0.0000000001) # add small amount to avoid division by 0
+    current_price = quote.askprice
+    return current_imbalance, current_price
+
+def getPriceHistory(c, ticker):
+    r = c.get_price_history(ticker, period_type=client.Client.PriceHistory.PeriodType.YEAR, period=client.Client.PriceHistory.Period.TWENTY_YEARS, frequency_type=client.Client.PriceHistory.FrequencyType.DAILY, frequency=client.Client.PriceHistory.Frequency.DAILY)
+    print(json.dumps(r.json(), indent=4))  
+    
+def placeBuyOrder(c, ticker, amnt, price):
+    # check if last order is filled
+    order = getLastOrder()
+    print(str(order[0]['symbol']) + '-> status: ' + str(order[0]['status']))
+    
+    if order[0]['status'] == 'FILLED':
+        response = c.place_order(personal_vars.number, equity_buy_limit(ticker, amnt, price)) 
+        print(response)
+    else:
+        print('Last order not filled, buy order failed!')
+
+def placeBuyAlpacaOrder(api, ticker, amnt, price, orders, positions):
+    response = None
+    
+    if (len(orders) == 0) & (len(positions) == 0): # we don't have any stocks owned or open orders
+        response = api.submit_order(symbol=ticker, qty=amnt, side='buy', type='limit', time_in_force='day', limit_price=price)    
+    elif len(positions) > 0:
+        print('We already own a stock! Not going to buy another!')
+    else: 
+        print('We already have an open order not yet filled! -> Cancelling open order now')
+        #api.cancel_all_orders()
+        
+    return response
+  
+def placeSellAlpacaOrder(api, ticker, amnt, price, limit_order, positions):
+    response = None
+    order_status = -1
+    
+    if (len(api.list_orders()) > 0):
+        print('Pending orders! -> Cancelling orders now')
+        api.cancel_all_orders()
+
+    if len(positions) == 1: # we own one stock
+        if limit_order:
+            print('')
+            #response = api.submit_order(symbol=ticker, qty=amnt, side='sell', type='limit', time_in_force='day', limit_price=price)    
+        else:
+            response = api.submit_order(symbol=ticker, qty=amnt, side='sell', type='market', time_in_force='day')                
+    elif len(positions) > 1:
+        print('We own more than one position!! -> Selling all positions now')
+        api.cancel_all_orders()
+        response = api.close_all_positions()
+    else:
+        print('We do not own this stock!')
+    
+    return response, order_status
+    
+def stop():
+    print('Sorry, I lost too much of your hard-earned money ($' + str(MAX_LOSS) + ')... Quitting now')
+    sys.exit()
+
+def placeSellLimitOrder(c, ticker, amnt, price):
+    response = c.place_order(personal_vars.number, equity_sell_limit(ticker, amnt, price))
+    print('response')
+    
+def placeSellMarketOrder(c, ticker, amnt):
+    response = c.place_order(personal_vars.number, equity_sell_market(ticker, amnt))
+    print('response')
+    
+def getTickersFromMarketWatch():
+    url = 'https://www.marketwatch.com/investing/index/spx?mod=newsviewer_click'
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+    ticker = soup.find_all('span', class_='mover__symbol')
+    ticksToRemove = []
+    
+    if len(ticker) > 0:
+        for t in ticker:
+            if (t.text != ''):
+                if float(t.find_next('bg-quote', field='percentChange').text) < 0:
+                    ticksToRemove.append(t)
+            else:
+                ticksToRemove.append(t)
+        
+        ticker = [t.text for t in ticker if t not in ticksToRemove]
+        lowestPriceIndex = 0
+        lowestPrice = 0
+        for t in range(0, len(ticker)):
+            link = 'https://www.marketwatch.com/investing/stock/' + ticker[t]
+            response = requests.get(link)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            find = soup.find('bg-quote', class_='value', field='Last')
+            if find is not None:
+                text = find.text.replace('$', '').replace(',', '')
+                price = float(text)
+                if (lowestPrice == 0) | (price < lowestPrice):
+                    lowestPrice = price
+                    lowestPriceIndex = t
+        
+        if lowestPrice != 0:
+            if lowestPrice >= MAX_MONEY_TO_SPEND:
+                print('Price too high ---- trying again soon')
+                time.sleep(900)
+                getTickersFromMarketWatch()
+            else:
+                return ticker[lowestPriceIndex], lowestPrice
+        else:
+            return None
+
+def writeTradeToCSV(ticker, buy_price, sell_price, buy_imbalance, sell_imbalance): # only for testing and review
+    profit = AMOUNT_TO_TRADE * (sell_price - buy_price)
+    if not (profit == 0):
+        gained = profit > 0
+        with open('trades.csv', 'a+', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([ticker, buy_price, sell_price, profit, gained, buy_imbalance, sell_imbalance, datetime.today().strftime('%D')])
+
+def graphByDay():
+    data = pd.read_csv('trades.csv').dropna(how='all')
+    rowIndex = 0
+    dates = []
+    profits = []
+    while rowIndex < data.shape[0]:
+        date = data['Date'][rowIndex]
+        dayDataIndices = np.where(data.iloc[:, 7] == date)[0]
+        dayData = data.iloc[dayDataIndices, 3]
+        profit = sum(dayData)
+        profits.append(profit)
+        rowIndex = dayDataIndices[-1] + 1
+        date = list(str(date))
+        date = ''.join(date[0:(len(date) - 5)])
+        dates.append(date)   
+    # graph
+    fig = plt.figure(figsize = (10, 7))
+    ax = fig.add_subplot(111) 
+    # Creating axes instance 
+    ax.bar(list(range(0, len(dates))), profits)
+    ax.set_xticks(list(range(0, len(dates))))
+    ax.set_xticklabels(dates)
+    plt.title('Profit by day')
+    for i,j in zip(list(range( 0, len(dates))), profits):
+        plt.annotate(str(round(j, 2)), xy = (i - 0.5, j + 40))
+    plt.savefig('profit_by_day.jpeg')
+    plt.show()
+    
+def graphToday():
+    data = pd.read_csv('trades.csv').dropna(how='all')
+    rowIndex = data.shape[0] - 1
+    date = data['Date'][rowIndex]
+    dayDataIndices = np.where(data.iloc[:, 7] == date)[0]
+    dayData = data.iloc[dayDataIndices, 3]
+    # graph
+    fig = plt.figure(figsize = (10, 7))
+    ax = fig.add_subplot(111) 
+    # Creating axes instance 
+    ax.bar(list(range(0, len(dayData))), dayData)
+    plt.title('Profit today')
+    plt.savefig('profit_today.jpeg')
+    plt.show()
+    
+def getTime():
+    CURRENT_HOUR = int(datetime.now(timezone('US/Eastern')).strftime('%H'))
+    CURRENT_MIN = int(datetime.now(timezone('US/Eastern')).strftime('%M'))
+    CURRENT_SEC = int(datetime.now(timezone('US/Eastern')).strftime('%S'))
+    return CURRENT_HOUR, CURRENT_MIN, CURRENT_SEC
+
+def getLastOrder():
+    return client.get_orders_by_path(personal_vars.dylan_number).json()
+
+def setSellVariables(position_info, BUY_IMBALANCE, current_imbalance):
+    # now store variables
+    PROFIT = float(position_info.unrealized_pl)
+    SELL_PRICE = float(position_info.market_value) / float(position_info.qty)
+    BUY_PRICE = SELL_PRICE - PROFIT
+    SELL_IMBALANCE = current_imbalance
+    writeTradeToCSV(f1, BUY_PRICE, SELL_PRICE, BUY_IMBALANCE, SELL_IMBALANCE)
+    OWN_STOCK = False
+    #PROFIT = AMOUNT_TO_TRADE * (SELL_PRICE - BUY_PRICE)
+    #TOTAL_PROFIT += PROFIT
+    print('SOLD ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + '! -----------> Sell price: $' + str(SELL_PRICE) + ', Profit Realized: $' + str(round(PROFIT, 3)))
+    return OWN_STOCK
+
+def setBuyVariables(position_info, current_imbalance):
+    PROFIT = float(position_info.unrealized_pl)
+    BUY_PRICE = (float(position_info.market_value) / float(position_info.qty)) - PROFIT
+    BUY_IMBALANCE = current_imbalance
+    #writeTradeToCSV(f1, BUY_PRICE, None, BUY_IMBALANCE, None)
+    OWN_STOCK = True
+    print('BOUGHT ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + '! -----------> Buy price: $' + str(BUY_PRICE))
+    return OWN_STOCK, PROFIT, BUY_IMBALANCE
+
+def checkOrderStatus(api):
+    orders = api.list_orders()
+    
+    if len(orders) == 0:
+        return 0 # no pending orders
+    elif (len(orders) == 1) & (orders[0].status == 'new') & (orders[0].side == 'buy'):
+        return 1 # pending buy order
+    elif len(orders) == 1 & (orders[0].status == 'new') & (orders[0].side == 'sell'):
+        return -1 # pending sell order
+
+def createIndex(imbalance, rsi):
+    rsi = 1 - rsi # high number is now better!!!
+    rsi = (rsi * 2) - 1 # scale between -1, 1 :)
+    return rsi + imbalance
+
+r"""
+# establish webdriver
+try:
+    client = auth.client_from_token_file(personal_vars.token_path, personal_vars.api_key)
+except:
+
+    from selenium import webdriver
+    with webdriver.Chrome(executable_path=r'C:\Users\dylan\Documents\Python Scripts\HFT\chromedriver') as driver:
+        client = auth.client_from_login_flow(driver, personal_vars.api_key, personal_vars.redirect_uri, personal_vars.token_path)
+"""   
+        
+# trade variables
+BUY_THRESHOLD = 0.5 # how big the imbalance magnitude needs to be to make a trade
+SELL_THRESHOLD = -0.3
+BUY_PRICE = 0
+BUY_IMBALANCE = 0
+SELL_PRICE = 0
+SELL_IMBALANCE = 0
+OWN_STOCK = False
+TOTAL_PROFIT = 0
+AMOUNT_TO_TRADE = 1 # the amount of stock we buy/sell each trade
+MAX_MONEY_TO_SPEND = 2000
+profit = 0
+START_MONEY = api.get_account().cash
+TRADE_STATUS = 0 # 0 = no trades pending, -1 = sell pending, 1 = buy pending
+CLIENT_ORDER_ID = None # used to check pending orders
+LAST_RESPONSE = None
+
+# general variables
+START_TIME = time.time()
+f1, LOWEST_PRICE = getTickersFromMarketWatch()
+OUTSIDE_OF_TRADING_HOURS = False
+MAX_LOSS = 50
+CAN_BUY_TODAY = True
+DELAY = 1 # delay in seconds between iterations - DON'T SET BELOW 0.5 OR IT EXCEEDS THE 120 CALLS PER MIN THRESHOLD ON TDAMERITRADE
+
+
+if __name__ == '__main__':
+    while (True):
+        
+        # get time
+        CURRENT_HOUR, CURRENT_MIN, _ = getTime()
+        
+        # is it trading hours?
+        while(((CURRENT_HOUR + (CURRENT_MIN / 60)) >= 9.5) & (CURRENT_HOUR < 16) & (datetime.today().weekday() != 5) & (datetime.today().weekday() != 6)):
+
+            # get time
+            CURRENT_HOUR, CURRENT_MIN, CURRENT_SEC = getTime()
+            print(str(CURRENT_HOUR) + ':' + str(CURRENT_MIN) + ':' + str(CURRENT_SEC))
+            
+            # can we buy?
+            if CAN_BUY_TODAY:
+                OUTSIDE_OF_TRADING_HOURS = False
+                
+                if not OWN_STOCK:
+                    # get new stock from Fast Movers on MarketWatch
+                    DELTA_TIME = time.time() - START_TIME
+                    
+                    if (round(DELTA_TIME) % 15 == 0):
+                        tickers = getTickersFromMarketWatch()
+                        if (tickers != None):
+                            f1, LOWEST_PRICE = tickers
+                            print('GOT NEW TICKER: %s' % f1)
+                  
+                # get quote from ticker
+                #q = getQuote(client, f1)
+                quote = getAlpacaQuote(api, f1)
+                imb = calculateImbalance(quote)
+                if imb[0]:
+                    current_imbalance = imb[0]
+                if imb[1]:
+                    current_price = imb[1]
+                # calculate imbalance and current price
+                positions = api.list_positions()
+                orders = api.list_orders()  
+                OWN_STOCK = len(positions) == 1
+                
+                # calculate profit
+                if (OWN_STOCK):
+                    #profit = current_price - BUY_PRICE
+                    profit = float(api.get_position(f1).unrealized_pl) # this should return TOTAL profit
+                    #scaledProfit = profit * AMOUNT_TO_TRADE
+                    string = ', profit: $' + str(profit)
+                else:
+                    string = ''
+                    # get max number of positions we can buy
+                    try:
+                        AMOUNT_TO_TRADE = math.floor(MAX_MONEY_TO_SPEND / current_price)
+                    except ZeroDivisionError:
+                        continue
+                    
+                # check for market close
+                if (CURRENT_HOUR == 15) & (CURRENT_MIN == 59): # last minute of trading day -> sell all positions
+                    if (OWN_STOCK):
+                        # sell now at MARKET PRICE INSTEAD OF LIMIT
+                        # placeSellMarketOrder(client,  f1, AMOUNT_TO_TRADE)
+                        response, PREV_TRADE_ORDER_STATUS = placeSellAlpacaOrder(api, f1, AMOUNT_TO_TRADE, current_price, False)
+                        while TRADE_STATUS != 0:
+                            time.sleep(1)
+                        
+                        OWN_STOCK = setSellVariables(api.get_position(symbol=f1), BUY_IMBALANCE, current_imbalance)
+                        # now store variables
+                        """
+                        SELL_PRICE = current_price
+                        SELL_IMBALANCE = current_imbalance
+                        writeTradeToCSV(f1, BUY_PRICE, SELL_PRICE, BUY_IMBALANCE, SELL_IMBALANCE)
+                        OWN_STOCK = False
+                        PROFIT = AMOUNT_TO_TRADE * (SELL_PRICE - BUY_PRICE)
+                        TOTAL_PROFIT += PROFIT
+                        print('SOLD ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + '! -----------> Sell price: $' + str(SELL_PRICE) + ', Profit Realized: ' + str(round(PROFIT, 3)))
+                        """
+                        
+                    print('The trading day is over, I have earned you $' + str(TOTAL_PROFIT) + ' today.')
+                    CAN_BUY_TODAY = False
+                    break
+                    
+                # use imbalance to calculate if stock is a good bet
+                print('ticker: ' + str(f1) + ', imbalance: ' + str(round(current_imbalance, 3)) + ', price: $' + str(current_price) + string + ', total profit: $' + str(TOTAL_PROFIT))
+                if (current_imbalance >= BUY_THRESHOLD) & (not OWN_STOCK): # stock will probably go up -> buy
+                    if (not OWN_STOCK):
+                        if (AMOUNT_TO_TRADE * current_price > MAX_MONEY_TO_SPEND): # about to over buy
+                            print('For some fucking reason, I was ABOUT to buy too much (' + str(AMOUNT_TO_TRADE) + ') of ' + str(f1) + '. Lowering potential position by one...')
+                            AMOUNT_TO_TRADE -= 1
+                            if (AMOUNT_TO_TRADE * current_price > MAX_MONEY_TO_SPEND): # still about to over buy
+                                print('Even after lowering position by one, I still tried to buy too much (' + str(AMOUNT_TO_TRADE) + ') of ' + str(f1) + '. So now I am quitting and you can figure this the fuck out.')
+                                sys.exit()
+                        else:
+                            # buy now
+                            # placeBuyOrder(client, f1, AMOUNT_TO_TRADE, current_price)
+                            response, PREV_TRADE_ORDER_STATUS = placeBuyAlpacaOrder(api, f1, AMOUNT_TO_TRADE, current_price, orders, positions)
+                            
+                            # now store variables to write to csv file later
+                            """
+                            BUY_PRICE = current_price
+                            profit = current_price - BUY_PRICE
+                            BUY_IMBALANCE = current_imbalance
+                            OWN_STOCK = True
+                            print('BOUGHT ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + '! -----------> Buy price: $' + str(current_price))
+                            """
+                                            
+                elif ((current_imbalance <= SELL_THRESHOLD) | (abs(profit) > 0.5)) & OWN_STOCK: # stock will probably go down -> sell
+                    # sell now
+                    # placeSellLimitOrder(client,  f1, AMOUNT_TO_TRADE)
+                    response, PREV_TRADE_ORDER_STATUS = placeSellAlpacaOrder(api, f1, AMOUNT_TO_TRADE, current_price, False, positions)
+                    
+                    # now store variables
+                    """SELL_PRICE = current_price
+                    SELL_IMBALANCE = current_imbalance
+                    writeTradeToCSV(f1, BUY_PRICE, SELL_PRICE, BUY_IMBALANCE, SELL_IMBALANCE)
+                    OWN_STOCK = False
+                    PROFIT = AMOUNT_TO_TRADE * (SELL_PRICE - BUY_PRICE)
+                    TOTAL_PROFIT += PROFIT
+                    print('SOLD ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + '! -----------> Sell price: $' + str(SELL_PRICE) + ', Profit Realized: $' + str(round(PROFIT, 3)))
+                    """
+
+                #if ((current_imbalance <= SELL_THRESHOLD) & (not OWN_STOCK)): # try to cancel order if I ordered but haven't bought yet - the stock doesn't look so appealing anymore
+                    #client.cancel_order(personal_vars.dylan_number, getLastOrder()[0]['orderId'])
+                    
+                if (TOTAL_PROFIT <= (MAX_LOSS * -1)) & OWN_STOCK: # lost too much today :(
+                    # sell now
+                    # placeSellMarketOrder(client,  f1, AMOUNT_TO_TRADE)
+                    response, PREV_TRADE_ORDER_STATUS = placeSellAlpacaOrder(api, f1, AMOUNT_TO_TRADE, current_price, True, positions)
+                    
+                    # now store variables
+                    """
+                    SELL_PRICE = current_price
+                    SELL_IMBALANCE = current_imbalance
+                    writeTradeToCSV(f1, BUY_PRICE, SELL_PRICE, BUY_IMBALANCE, SELL_IMBALANCE)
+                    OWN_STOCK = False
+                    PROFIT = AMOUNT_TO_TRADE * (SELL_PRICE - BUY_PRICE)
+                    TOTAL_PROFIT += PROFIT
+                    print('SOLD ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + '! -----------> Sell price: $' + str(SELL_PRICE) + ', Profit Realized: ' + str(round(PROFIT, 3)))
+                    """
+                    
+                    stop()
+                    
+                if (profit <= (MAX_LOSS * -1)) & OWN_STOCK: # lost too much in one trade - sell now
+                    # sell now
+                    # placeSellMarketOrder(client,  f1, AMOUNT_TO_TRADE)
+                    response, PREV_TRADE_ORDER_STATUS = placeSellAlpacaOrder(api, f1, AMOUNT_TO_TRADE, current_price, True, positions)
+                    
+                    # now store variables
+                    """
+                    SELL_PRICE = current_price
+                    SELL_IMBALANCE = current_imbalance
+                    writeTradeToCSV(f1, BUY_PRICE, SELL_PRICE, BUY_IMBALANCE, SELL_IMBALANCE)
+                    OWN_STOCK = False
+                    PROFIT = AMOUNT_TO_TRADE * (SELL_PRICE - BUY_PRICE)
+                    TOTAL_PROFIT += PROFIT
+                    print('SOLD ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + ' because individual loss was too great. :( -----------> Sell price: $' + str(SELL_PRICE) + ', Profit Realized: $' + str(round(PROFIT, 3)))
+                    """
+                
+                # update total profit
+                account = api.get_account()
+                TOTAL_PROFIT = float(account.equity) - float(account.last_equity)
+                        
+                # avoid too many api calls
+                time.sleep(DELAY)
+                
+            else:
+                print('Here is your daily summary ->')
+                graphToday()
+                print('Here is your all-time summary ->')
+                graphByDay()
+                
+    if TOTAL_PROFIT <= (MAX_LOSS * -1):
+        if OWN_STOCK:
+            # sell now
+            # placeSellMarketOrder(client,  f1, AMOUNT_TO_TRADE)
+            response, PREV_TRADE_ORDER_STATUS = placeSellAlpacaOrder(api, f1, AMOUNT_TO_TRADE, current_price, True, positions)
+            
+            # now store variables
+            """SELL_PRICE = current_price
+            SELL_IMBALANCE = current_imbalance
+            writeTradeToCSV(f1, BUY_PRICE, SELL_PRICE, BUY_IMBALANCE, SELL_IMBALANCE)
+            OWN_STOCK = False
+            PROFIT = AMOUNT_TO_TRADE * (SELL_PRICE - BUY_PRICE)
+            TOTAL_PROFIT += PROFIT
+            print('SOLD ' + str(AMOUNT_TO_TRADE) + ' SHARES OF ' + f1 + '! -----------> Sell price: ' + str(SELL_PRICE) + ', Profit Realized: ' + str(round(PROFIT, 3)))
+            """
+        stop()
+    
+    # it IS outside of trading hours, just need to update the OUTSIDE_OF_TRADING_HOURS variable
+    if (not OUTSIDE_OF_TRADING_HOURS):
+        day_string = ' tomorrow.'
+        if (datetime.today().weekday() == 5):
+            day_string = ' on Monday.'
+        print('Outside of trading hours - I will resume my money making' + day_string)
+        OUTSIDE_OF_TRADING_HOURS = True
+        if not ((CURRENT_HOUR == 15) & (CURRENT_MIN == 59)):
+            CAN_BUY_TODAY = True
+    
+    
